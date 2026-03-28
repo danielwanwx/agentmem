@@ -1,4 +1,4 @@
-"""MemoryStore: main API surface for agent-memory SDK."""
+"""MemoryStore: main API surface for agentmem SDK."""
 import json
 import sqlite3
 import threading
@@ -500,7 +500,7 @@ class MemoryStore:
         if not blocks:
             return ""
 
-        return "# [agent-memory] Relevant context\n" + "\n\n---\n".join(blocks)
+        return "# [agentmem] Relevant context\n" + "\n\n---\n".join(blocks)
 
     def close(self):
         self._conn.close()

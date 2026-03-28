@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "claude-agent-memory"
+name = "agentmem"
 version = "0.1.0"
-description = "Persistent memory for Claude Code — SQLite-backed knowledge store with BM25 search and MCP integration"
+description = "Persistent memory for AI coding agents — SQLite-backed knowledge store with BM25+Vector search and MCP integration"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

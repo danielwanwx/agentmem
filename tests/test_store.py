@@ -179,7 +179,7 @@ class TestInject:
         results = store.search("inject")
         if results:
             output = store.inject(results)
-            assert "agent-memory" in output
+            assert "agentmem" in output
             assert "Test inject" in output
 
     def test_inject_respects_max_tokens(self, store):

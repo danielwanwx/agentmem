@@ -1,4 +1,4 @@
-"""Shared fixtures for agent-memory tests."""
+"""Shared fixtures for agentmem tests."""
 import os
 import tempfile
 import pytest

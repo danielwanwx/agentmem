@@ -1,7 +1,7 @@
-"""am init — one-time setup for claude-agent-memory.
+"""am init — one-time setup for agentmem.
 
 Sets up:
-  1. ~/.agent-memory/memory.db  (created on first MemoryStore() call)
+  1. ~/.agentmem/memory.db  (created on first MemoryStore() call)
   2. MCP server registration in ~/.claude/mcp.json
   3. SessionStart and Stop hooks in ~/.claude/hooks/
   4. Memory instruction block appended to ~/.claude/CLAUDE.md
@@ -19,7 +19,7 @@ MCP_JSON = CLAUDE_DIR / "mcp.json"
 CLAUDE_MD = CLAUDE_DIR / "CLAUDE.md"
 
 _CLAUDE_MD_BLOCK = """
-## Persistent Memory (agent-memory)
+## Persistent Memory (agentmem)
 
 MCP tools: `am_search` · `am_save` · `am_session_checkpoint` · `am_state_get` · `am_state_set`
 
@@ -38,12 +38,12 @@ Skip: obvious facts, anything already in the codebase.
 to persistent memory without ending the session. Safe to call multiple times (upserts).
 This ensures knowledge is searchable cross-session even if the session crashes or times out.
 
-<!-- END:agent-memory -->
+<!-- END:agentmem -->
 """
 
 _SESSION_START_HOOK = """\
 #!/bin/bash
-# agent-memory: session lifecycle (SessionStart hook)
+# agentmem: session lifecycle (SessionStart hook)
 CLI="am"
 PROJECT=$(basename "${CLAUDE_PROJECT_DIR:-$(pwd)}")
 SESSION_ID=$($CLI session start --project "$PROJECT" --source "cli:${PROJECT}" 2>/dev/null)
@@ -57,7 +57,7 @@ exit 0
 
 _STOP_HOOK = """\
 #!/bin/bash
-# agent-memory: checkpoint per turn (Stop hook)
+# agentmem: checkpoint per turn (Stop hook)
 CLI="am"
 SESSION_ID=$($CLI state get --key current_session_id 2>/dev/null | tr -d '"')
 if [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ]; then
@@ -74,7 +74,7 @@ exit 0
 
 _USER_PROMPT_HOOK = """\
 #!/bin/bash
-# agent-memory: capture user messages (UserPromptSubmit hook)
+# agentmem: capture user messages (UserPromptSubmit hook)
 CLI="am"
 SESSION_ID=$($CLI state get --key current_session_id 2>/dev/null | tr -d '"')
 if [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ] && [ -n "$CLAUDE_USER_PROMPT" ]; then
@@ -86,13 +86,13 @@ exit 0
 
 
 def run():
-    print("Setting up claude-agent-memory...\n")
+    print("Setting up agentmem...\n")
 
-    # 1. Init DB (creates ~/.agent-memory/memory.db)
+    # 1. Init DB (creates ~/.agentmem/memory.db)
     try:
         from agent_memory.store import MemoryStore
         MemoryStore()
-        _ok("Created ~/.agent-memory/memory.db")
+        _ok("Created ~/.agentmem/memory.db")
     except Exception as e:
         _err(f"DB init failed: {e}")
         sys.exit(1)
@@ -122,7 +122,7 @@ def _setup_mcp():
             config = {}
 
     mcp_servers = config.setdefault("mcpServers", {})
-    if "agent-memory" in mcp_servers:
+    if "agentmem" in mcp_servers:
         _skip("MCP server already registered in ~/.claude/mcp.json")
         return
 
@@ -131,7 +131,7 @@ def _setup_mcp():
         _warn("'am' not found in PATH — using 'am' as command name anyway")
         am_path = "am"
 
-    mcp_servers["agent-memory"] = {"command": am_path, "args": ["mcp"]}
+    mcp_servers["agentmem"] = {"command": am_path, "args": ["mcp"]}
     MCP_JSON.write_text(json.dumps(config, indent=2))
     _ok("Registered MCP server in ~/.claude/mcp.json")
 
@@ -147,20 +147,20 @@ def _setup_hooks():
     for name, content in hooks.items():
         hook_dir = HOOKS_DIR / name
         hook_dir.mkdir(exist_ok=True)
-        hook_file = hook_dir / "agent-memory.sh"
+        hook_file = hook_dir / "agentmem.sh"
         if hook_file.exists():
-            _skip(f"Hook already exists: ~/.claude/hooks/{name}/agent-memory.sh")
+            _skip(f"Hook already exists: ~/.claude/hooks/{name}/agentmem.sh")
             continue
         hook_file.write_text(content)
         hook_file.chmod(hook_file.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-        _ok(f"Installed hook: ~/.claude/hooks/{name}/agent-memory.sh")
+        _ok(f"Installed hook: ~/.claude/hooks/{name}/agentmem.sh")
 
 
 def _setup_claude_md():
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
     if CLAUDE_MD.exists():
         existing = CLAUDE_MD.read_text()
-        if "END:agent-memory" in existing:
+        if "END:agentmem" in existing:
             _skip("Memory instructions already in ~/.claude/CLAUDE.md")
             return
         CLAUDE_MD.write_text(existing + _CLAUDE_MD_BLOCK)

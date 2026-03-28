@@ -1,14 +1,14 @@
-# claude-agent-memory
+# agentmem
 
 Persistent memory for [Claude Code](https://claude.ai/code) — a self-evolving knowledge layer that survives across sessions, grows from every conversation, and surfaces relevant context automatically.
 
 ```
-pip install claude-agent-memory
+pip install agentmem
 am init
 # Restart Claude Code → done
 ```
 
-No external database. No cloud service. A single SQLite file at `~/.agent-memory/memory.db`.
+No external database. No cloud service. A single SQLite file at `~/.agentmem/memory.db`.
 
 ---
 
@@ -16,7 +16,7 @@ No external database. No cloud service. A single SQLite file at `~/.agent-memory
 
 Every Claude Code session starts from zero. Context window fills up. You re-explain the same architecture, re-debug the same gotchas, re-type the same config values — session after session.
 
-`claude-agent-memory` gives Claude a memory that persists across sessions. Knowledge is captured automatically from your conversations and file edits. A debugging insight from six months ago surfaces when it's relevant today.
+`agentmem` gives Claude a memory that persists across sessions. Knowledge is captured automatically from your conversations and file edits. A debugging insight from six months ago surfaces when it's relevant today.
 
 ---
 
@@ -25,17 +25,17 @@ Every Claude Code session starts from zero. Context window fills up. You re-expl
 **Requirements:** Python 3.10+, Claude Code
 
 ```bash
-pip install claude-agent-memory
+pip install agentmem
 am init
 ```
 
 `am init` does everything in one shot:
 
 ```
-✓ Created ~/.agent-memory/memory.db
+✓ Created ~/.agentmem/memory.db
 ✓ Registered MCP server in ~/.claude/mcp.json
-✓ Installed hook: ~/.claude/hooks/SessionStart/agent-memory.sh
-✓ Installed hook: ~/.claude/hooks/Stop/agent-memory.sh
+✓ Installed hook: ~/.claude/hooks/SessionStart/agentmem.sh
+✓ Installed hook: ~/.claude/hooks/Stop/agentmem.sh
 ✓ Appended memory instructions to ~/.claude/CLAUDE.md
 ```
 
@@ -82,7 +82,7 @@ Claude Code closes (Stop hook)
 One SQLite file. Four semantic layers.
 
 ```
-~/.agent-memory/memory.db
+~/.agentmem/memory.db
 │
 │  ── SEARCH LAYER (virtual) ──────────────────────────────────────
 │
@@ -239,7 +239,7 @@ am mcp                               # start MCP server (stdio) — called by Cl
 
 ## Optional: vector search with Ollama
 
-By default, claude-agent-memory uses BM25 full-text search (Sub-Layer 2). This handles ~80% of queries well — technical terms, config keys, function names, error codes.
+By default, agentmem uses BM25 full-text search (Sub-Layer 2). This handles ~80% of queries well — technical terms, config keys, function names, error codes.
 
 For fuzzy / semantic queries ("that kafka thing we fixed"), install Ollama and pull an embedding model:
 
@@ -247,7 +247,7 @@ For fuzzy / semantic queries ("that kafka thing we fixed"), install Ollama and p
 # Install Ollama: https://ollama.com
 ollama pull qwen3-embedding:8b    # 4096-dim, ~5GB
 
-pip install 'claude-agent-memory[vector]'
+pip install 'agentmem[vector]'
 ```
 
 When Ollama is running, searches automatically upgrade to hybrid BM25 + vector (Sub-Layer 1). When Ollama is offline, they fall back to BM25 silently. No configuration required.
@@ -264,7 +264,7 @@ Claude Code sessions expire after ~8 hours. Here is what that means in practice,
 
 ### Day 1 — 09:00, session starts
 
-**Without agent-memory:**
+**Without agentmem:**
 ```
 You:    The dan-sync Spark job keeps failing on YARN with a timeout.
         Help me debug it.
@@ -273,7 +273,7 @@ Claude: Sure — what does the error look like? What's your submission
 (you spend 15 minutes re-explaining the stack)
 ```
 
-**With agent-memory:**
+**With agentmem:**
 ```
 [SessionStart hook creates session silently]
 
@@ -302,12 +302,12 @@ Zero re-explanation. Claude already knows your stack.
 
 After 3 hours of debugging you find the issue: the Spark executor memory config in the pipeline YAML was using a soft limit that YARN silently ignores, causing the container to get killed without a clear error.
 
-**Without agent-memory:**
+**Without agentmem:**
 ```
 Claude explains the fix. You apply it. The insight lives only in this session.
 ```
 
-**With agent-memory:**
+**With agentmem:**
 ```
 Claude explains the fix, then calls am_save automatically:
 
@@ -325,7 +325,7 @@ Claude explains the fix, then calls am_save automatically:
 
 ### Day 1 — 17:00, session expires (8-hour limit)
 
-**Without agent-memory:**
+**Without agentmem:**
 ```
 [Session context window compresses / expires]
 
@@ -338,7 +338,7 @@ Claude: I don't have context from a previous session.
  what you already found yesterday)
 ```
 
-**With agent-memory:**
+**With agentmem:**
 ```
 [Stop hook fires silently]
 → reads session messages
@@ -369,7 +369,7 @@ Exact continuation. No re-explanation. No re-derivation.
 
 ### 3 weeks later — different pipeline, same platform
 
-**Without agent-memory:**
+**Without agentmem:**
 ```
 A different Spark job starts failing with the same silent OOM pattern.
 → 45 minutes debugging
@@ -378,7 +378,7 @@ A different Spark job starts failing with the same silent OOM pattern.
 (every engineer re-learns the same lesson)
 ```
 
-**With agent-memory:**
+**With agentmem:**
 ```
 You: This Airflow-triggered Spark job on YARN keeps dying silently.
      No error in the logs.
@@ -453,18 +453,18 @@ After `am init`, three things change in your `~/.claude/` directory:
 ```json
 {
   "mcpServers": {
-    "agent-memory": { "command": "am", "args": ["mcp"] }
+    "agentmem": { "command": "am", "args": ["mcp"] }
   }
 }
 ```
 
-**`hooks/SessionStart/agent-memory.sh`** — creates a session on startup:
+**`hooks/SessionStart/agentmem.sh`** — creates a session on startup:
 ```bash
 SESSION_ID=$(am session start --project "$PROJECT" --source "cli:$PROJECT")
 am state set --key current_session_id --value "\"$SESSION_ID\""
 ```
 
-**`hooks/Stop/agent-memory.sh`** — ends and promotes session on exit:
+**`hooks/Stop/agentmem.sh`** — ends and promotes session on exit:
 ```bash
 SESSION_ID=$(am state get --key current_session_id | tr -d '"')
 am session end --session-id "$SESSION_ID"
@@ -473,7 +473,7 @@ am state set --key current_session_id --value "null"
 
 **`CLAUDE.md`** — tells Claude when to use the MCP tools:
 ```markdown
-## Persistent Memory (agent-memory)
+## Persistent Memory (agentmem)
 You have am_search and am_save MCP tools.
 • Before answering questions about past work → call am_search
 • After learning non-obvious facts → call am_save with P0/P1/P2
@@ -488,13 +488,13 @@ You have am_search and am_save MCP tools.
 am --version
 
 # Upgrade (pipx recommended)
-pipx upgrade claude-agent-memory
+pipx upgrade agentmem
 
 # Or via am
 am update
 ```
 
-claude-agent-memory checks PyPI once every 24 hours and prints a notice when a newer version is available.
+agentmem checks PyPI once every 24 hours and prints a notice when a newer version is available.
 
 ---
 

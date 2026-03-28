@@ -14,7 +14,7 @@ except ImportError:
 # Embedding dimensionality — must match EMBED_MODEL in vector.py
 VEC_DIMS = 4096
 
-DB_PATH = Path.home() / ".agent-memory" / "memory.db"
+DB_PATH = Path.home() / ".agentmem" / "memory.db"
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Three architecture enhancements for `claude-agent-memory`, implemented in dependency order. All three share the same "Ollama-optional graceful degradation" design philosophy — better quality with Ollama, fully functional without.
+Three architecture enhancements for `agentmem`, implemented in dependency order. All three share the same "Ollama-optional graceful degradation" design philosophy — better quality with Ollama, fully functional without.
 
 ---
 

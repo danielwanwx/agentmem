@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI entry point for claude-agent-memory.
+"""CLI entry point for agentmem.
 
 Usage:
   am init                                   # one-time setup (MCP + hooks + CLAUDE.md)

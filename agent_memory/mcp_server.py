@@ -1,4 +1,4 @@
-"""MCP server for agent-memory.
+"""MCP server for agentmem.
 
 Exposes am_search, am_save, am_state_get, am_state_set as MCP tools.
 Started via: am mcp  (stdio transport)
@@ -20,13 +20,13 @@ except ImportError:
 def run():
     if not _MCP_AVAILABLE:
         print(
-            "ERROR: mcp package not installed. Run: pip install 'claude-agent-memory[mcp]'",
+            "ERROR: mcp package not installed. Run: pip install 'agentmem[mcp]'",
             file=sys.stderr,
         )
         sys.exit(1)
 
     store = MemoryStore()
-    server = Server("agent-memory")
+    server = Server("agentmem")
 
     @server.list_tools()
     async def list_tools():
