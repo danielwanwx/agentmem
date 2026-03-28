@@ -29,8 +29,8 @@ htmlcov/
 # Autoresearch artifacts
 autoresearch-results.tsv
 
-# Internal docs / plans (not for public)
-docs/plans/
+# Internal docs (not for public)
+docs/
 
 # Build artifacts
 *.so
