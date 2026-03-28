@@ -1,0 +1,8 @@
+mcp>=1.0
+
+[dev]
+pytest
+pytest-cov
+
+[vector]
+sqlite-vec

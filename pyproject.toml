@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-agent-memory"
+version = "0.1.0"
+description = "Persistent memory for Claude Code — SQLite-backed knowledge store with BM25 search and MCP integration"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["claude", "mcp", "memory", "rag", "claude-code"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+# mcp is a core dependency — required for Claude Code integration
+dependencies = ["mcp>=1.0"]
+
+[project.scripts]
+am = "agent_memory.cli:main"
+
+[project.optional-dependencies]
+# Vector search via sqlite-vec (requires Ollama for embeddings)
+vector = ["sqlite-vec"]
+
+dev = ["pytest", "pytest-cov"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["agent_memory*"]

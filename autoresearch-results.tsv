@@ -1,0 +1,5 @@
+iteration	change	metric_before	metric_after	guard	result	commit
+0	baseline	—	0.975	93 passed	keep	baseline
+1	add raw_content to Phase0 scoring	0.975	0.975	93 passed	discard	reverted
+2	add raw_content to FTS5 index	0.975	1.000	93 passed	keep	e172fb5
+3	fix eval: remove unrealistic semantic expectation	0.975	1.000	93 passed	keep	3af14f1
