@@ -171,14 +171,124 @@ def cmd_session(args):
         print(json.dumps(rows))
 
 
+def cmd_namespace(args):
+    s = get_store()
+    if args.action == "list":
+        namespaces = s.namespace_list()
+        if getattr(args, "format", "text") == "json":
+            print(json.dumps(namespaces))
+        else:
+            for ns in namespaces:
+                proj = ns["project"]
+                count = ns["doc_count"]
+                print(f"  {proj:30s} {count:4d} docs")
+    elif args.action == "stats":
+        name = getattr(args, "name", None)
+        if not name:
+            print("Error: --name required for stats", file=sys.stderr)
+            sys.exit(1)
+        stats = s.namespace_stats(name)
+        print(f"Project: {stats['project']}")
+        print(f"  Documents: {stats['doc_count']}")
+        print(f"  P0: {stats['p0_count']}  P1: {stats['p1_count']}  P2: {stats['p2_count']}")
+
+
+def cmd_config(args):
+    if args.action == "set":
+        key = args.key
+        value = args.value
+        if key == "embedding_provider":
+            from agent_memory.embedding import set_provider, _PROVIDERS
+            if value not in _PROVIDERS:
+                print(f"Error: unknown provider '{value}'. Available: {', '.join(_PROVIDERS)}", file=sys.stderr)
+                sys.exit(1)
+            set_provider(value)
+            print(f"Embedding provider set to: {value}")
+            old_dims = get_store()  # trigger dimension check warning
+        else:
+            print(f"Error: unknown config key '{key}'", file=sys.stderr)
+            sys.exit(1)
+    elif args.action == "get":
+        from agent_memory.embedding import _load_config
+        config = _load_config()
+        key = args.key
+        if key:
+            val = config.get(key, "(not set)")
+            print(f"{key}: {val}")
+        else:
+            print(json.dumps(config, indent=2))
+
+
+def cmd_dream(args):
+    from agent_memory.dream import Dreamer, DreamLock
+    conn = get_store()._conn
+    force = getattr(args, "force", False)
+    min_hours = getattr(args, "min_hours", 24)
+    min_sessions = getattr(args, "min_sessions", 5)
+
+    dry_run = getattr(args, "dry_run", False)
+    dreamer = Dreamer(
+        conn=conn,
+        min_hours=0 if force else min_hours,
+        min_sessions=0 if force else min_sessions,
+    )
+
+    if getattr(args, "status", False):
+        lock = DreamLock()
+        hours = lock.hours_since_last()
+        sessions_since = dreamer._count_sessions_since(lock.last_dream_at())
+        print(f"Last dream: {'never' if hours == float('inf') else f'{hours:.1f}h ago'}")
+        print(f"Sessions since: {sessions_since}")
+        print(f"Gate: {'PASS' if hours >= min_hours and sessions_since >= min_sessions else 'BLOCKED'}")
+        return
+
+    result = dreamer.run(force=force, dry_run=dry_run)
+
+    if result.success:
+        prefix = "[DRY RUN] " if dry_run else ""
+        print(f"{prefix}Dream complete ({result.duration_ms}ms)")
+        print(f"  Sessions reviewed: {result.sessions_reviewed}")
+        print(f"  Patterns found: {result.patterns_found}")
+        print(f"  Contradictions resolved: {result.contradictions_resolved}")
+        print(f"  Documents created: {result.documents_created}")
+        print(f"  Documents updated: {result.documents_updated}")
+        print(f"  Documents pruned: {result.documents_pruned}")
+        print(f"  Stale detected: {result.stale_detected}")
+        print(f"  Cross-contradictions resolved: {result.cross_contradictions_resolved}")
+        print(f"  Redundant merged: {result.redundant_merged}")
+        if result.planned_actions:
+            print("  Planned actions:")
+            for action in result.planned_actions:
+                atype = action.get("type", "?")
+                detail = action.get("project") or action.get("title") or action.get("topic", "")
+                print(f"    {atype:20s} {str(detail):40s}")
+    else:
+        print(f"Dream skipped: {result.reason or ', '.join(result.errors)}")
+
+
 def cmd_mcp(_args):
     from agent_memory.mcp_server import run
     run()
 
 
+def cmd_serve(args):
+    from agent_memory.mcp_server import run
+    transport = getattr(args, "transport", "sse")
+    port = getattr(args, "port", 3333)
+    read_only = getattr(args, "read_only", False)
+    run(transport=transport, port=port, read_only=read_only)
+
+
 def cmd_init(_args):
     from agent_memory.init_cmd import run
     run()
+
+
+def cmd_dashboard(args):
+    from agent_memory.dashboard import start
+    port = getattr(args, "port", 8420)
+    allow_edits = getattr(args, "allow_edits", False)
+    start(port=port, allow_edits=allow_edits)
 
 
 def cmd_status(args):
@@ -239,11 +349,44 @@ def main():
     se_p.add_argument("--limit", type=int, default=100)
     se_p.add_argument("--include-cli", action="store_true", dest="include_cli")
 
+    # dream
+    dr_p = sub.add_parser("dream", help="Background memory consolidation")
+    dr_p.add_argument("--force", action="store_true", help="Skip gate checks")
+    dr_p.add_argument("--dry-run", action="store_true", dest="dry_run", help="Show planned actions without writing")
+    dr_p.add_argument("--status", action="store_true", help="Show dream status")
+    dr_p.add_argument("--min-hours", type=float, default=24, dest="min_hours")
+    dr_p.add_argument("--min-sessions", type=int, default=5, dest="min_sessions")
+
     # status (called by hooks to show inline feedback)
     status_p = sub.add_parser("status", help="Print one-line colored status (used by hooks)")
     status_p.add_argument("--event", default="idle",
                           choices=["session", "checkpoint", "message", "save", "search", "prune", "error", "idle"])
     status_p.add_argument("--detail", default="")
+
+    # config
+    cfg_p = sub.add_parser("config", help="Get/set agentmem configuration")
+    cfg_p.add_argument("action", choices=["set", "get"])
+    cfg_p.add_argument("--key", default=None, help="Config key (e.g. embedding_provider)")
+    cfg_p.add_argument("--value", default=None, help="Config value")
+
+    # namespace
+    ns_p = sub.add_parser("namespace", help="Manage project namespaces")
+    ns_p.add_argument("action", choices=["list", "stats"])
+    ns_p.add_argument("--name", default=None, help="Project name for stats")
+    ns_p.add_argument("--format", default="text", choices=["text", "json"])
+
+    # dashboard
+    dash_p = sub.add_parser("dashboard", help="Start web dashboard for knowledge base")
+    dash_p.add_argument("--port", type=int, default=8420)
+    dash_p.add_argument("--allow-edits", action="store_true", dest="allow_edits",
+                         help="Enable delete and priority changes from UI")
+
+    # serve (SSE transport for cross-tool access)
+    serve_p = sub.add_parser("serve", help="Start MCP server with SSE transport")
+    serve_p.add_argument("--transport", default="sse", choices=["stdio", "sse"])
+    serve_p.add_argument("--port", type=int, default=3333, help="HTTP port for SSE (default 3333)")
+    serve_p.add_argument("--read-only", action="store_true", dest="read_only",
+                         help="Disable write tools (am_save, am_state_set)")
 
     sub.add_parser("init", help="One-time setup: MCP registration, hooks, CLAUDE.md")
     sub.add_parser("mcp", help="Start MCP server (stdio transport)")
@@ -261,6 +404,16 @@ def main():
         cmd_state(args)
     elif args.cmd == "session":
         cmd_session(args)
+    elif args.cmd == "config":
+        cmd_config(args)
+    elif args.cmd == "namespace":
+        cmd_namespace(args)
+    elif args.cmd == "dream":
+        cmd_dream(args)
+    elif args.cmd == "dashboard":
+        cmd_dashboard(args)
+    elif args.cmd == "serve":
+        cmd_serve(args)
     elif args.cmd == "status":
         cmd_status(args)
     else:

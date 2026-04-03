@@ -163,6 +163,54 @@ TTL is derived automatically from `source`. Accessed documents have their TTL re
 
 ---
 
+## Architecture: dream consolidation
+
+`am dream` runs background memory consolidation in 5 phases:
+
+```
+Phase 1: Orient    — read existing documents (top 100 recent)
+Phase 2: Gather    — collect ended sessions since last dream
+Phase 3: Consolidate — cross-session pattern detection + contradiction resolution
+Phase 3.5: Health Check — proactive knowledge base quality maintenance
+Phase 4: Prune     — remove expired documents
+```
+
+### Phase 3.5: Health Check
+
+The health check operates on the **entire knowledge base**, not just new sessions. It runs three sub-checks:
+
+**1. Staleness Detection**
+
+Scans non-P0 documents for `code_sigs` (function/class references) that no longer exist in the project directory. Documents with >50% dead references get downgraded:
+
+- P1 → `expires_at` set to 7 days (grace period)
+- P2 → `expires_at` set to now (pruned immediately in Phase 4)
+
+**2. Cross-Document Contradiction Scan**
+
+Extends contradiction detection across ALL documents (not just within a single consolidation batch). When two documents in the same project have conflicting facts (e.g., `timeout: 30s` vs `timeout: 600s`), the older fact is removed.
+
+**3. Redundancy Merge**
+
+Finds document pairs with >70% key_facts overlap (fuzzy Jaccard similarity) and merges the smaller into the larger. Unique facts and decisions from the source document transfer to the target before deletion.
+
+When 3+ documents cluster around the same topic, a **concept index** document is generated — a lightweight map linking related documents with shared themes.
+
+### Gating
+
+Dream only runs when:
+- `min_hours` (default 24) have passed since last dream
+- `min_sessions` (default 5) ended sessions exist since last dream
+- Use `--force` to bypass gating
+
+```bash
+am dream --force              # run now
+am dream --force --dry-run    # preview planned actions without writing
+am dream --status             # check gate state
+```
+
+---
+
 ## MCP tools reference
 
 Claude calls these tools autonomously based on instructions injected by `am init` into `~/.claude/CLAUDE.md`.
