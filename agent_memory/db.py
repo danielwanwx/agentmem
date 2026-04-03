@@ -14,7 +14,7 @@ except ImportError:
 # Embedding dimensionality — must match EMBED_MODEL in vector.py
 VEC_DIMS = 4096
 
-DB_PATH = Path.home() / ".agentmem" / "memory.db"
+DB_PATH = Path.home() / ".am-memory" / "memory.db"
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -209,6 +209,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         except Exception:
             pass
 
+    # Clean up orphaned vec_documents rows (no matching documents row)
+    try:
+        conn.execute(
+            """DELETE FROM vec_documents
+               WHERE document_id NOT IN (SELECT doc_id FROM documents)"""
+        )
+        conn.commit()
+    except Exception:
+        pass  # vec_documents may not exist
+
     # Backfill FTS index for any documents not yet indexed
     try:
         indexed = conn.execute("SELECT COUNT(*) FROM documents_fts").fetchone()[0]
@@ -246,6 +256,7 @@ def init_db(path: str = None) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
     # Load sqlite-vec BEFORE running schema (vec0 virtual table needs it)
     _load_vec_extension(conn)
     conn.executescript(SCHEMA)

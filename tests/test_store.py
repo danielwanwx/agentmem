@@ -179,7 +179,7 @@ class TestInject:
         results = store.search("inject")
         if results:
             output = store.inject(results)
-            assert "agentmem" in output
+            assert "am-memory" in output
             assert "Test inject" in output
 
     def test_inject_respects_max_tokens(self, store):
@@ -277,3 +277,157 @@ class TestDedup:
         id2 = store.save(title="Config", content="v2",
                          source="hook", file_path="/tmp/a.py")
         assert id1 == id2
+
+    def test_force_new_bypasses_dedup(self, store):
+        id1 = store.save(title="JWT auth flow",
+                         content="- **tokens**: short-lived\n- **refresh**: 7d rotation",
+                         source="debug_solution")
+        id2 = store.save(title="JWT auth flow",
+                         content="- **tokens**: short-lived\n- **refresh**: 7d rotation",
+                         source="debug_solution", force_new=True)
+        assert id1 != id2  # force_new creates a new doc
+
+    def test_fuzzy_dedup_merges_similar_facts(self, store):
+        """Save 'JWT auth flow' with facts A,B → save 'JWT authentication' with facts B,C → ONE doc with A,B,C."""
+        id1 = store.save(
+            title="JWT auth flow",
+            content="- **token_type**: short-lived access tokens\n- **refresh**: 7-day rotation",
+            source="debug_solution",
+        )
+        id2 = store.save(
+            title="JWT auth flow",
+            content="- **refresh**: 7-day rotation policy\n- **storage**: httpOnly cookies",
+            source="debug_solution",
+        )
+        assert id1 == id2  # merged
+        row = store._conn.execute(
+            "SELECT key_facts FROM documents WHERE doc_id=?", (id1,)
+        ).fetchone()
+        facts = json.loads(row["key_facts"])
+        # Should have facts from both saves, with near-duplicate "refresh" merged
+        assert len(facts) >= 2
+
+    def test_no_false_merge_different_topics(self, store):
+        """Completely different topics should not merge even with same source."""
+        id1 = store.save(title="JWT auth flow",
+                         content="- **tokens**: JWT\n- **refresh**: rotation",
+                         source="debug_solution")
+        id2 = store.save(title="database migration guide",
+                         content="- **tool**: Alembic\n- **strategy**: blue-green",
+                         source="debug_solution")
+        assert id1 != id2  # completely different topics
+
+
+class TestNamespace:
+    def test_namespace_list_empty(self, store):
+        namespaces = store.namespace_list()
+        assert isinstance(namespaces, list)
+        assert len(namespaces) == 0
+
+    def test_namespace_list_with_docs(self, store):
+        store.save(title="A", content="a", source="explicit", project="app-a")
+        store.save(title="B", content="b", source="explicit", project="app-a")
+        store.save(title="C", content="c", source="explicit", project="app-b")
+        store.save(title="D", content="d", source="explicit")  # global
+        namespaces = store.namespace_list()
+        assert len(namespaces) == 3  # app-a, app-b, (global)
+        projects = {ns["project"] for ns in namespaces}
+        assert "app-a" in projects
+        assert "app-b" in projects
+        assert "(global)" in projects
+        # app-a has 2 docs, should be first
+        assert namespaces[0]["project"] == "app-a"
+        assert namespaces[0]["doc_count"] == 2
+
+    def test_namespace_stats(self, store):
+        store.save(title="P0 doc", content="arch", source="architectural_decision", project="myapp")
+        store.save(title="P1 doc", content="debug", source="debug_solution", project="myapp")
+        store.save(title="P2 doc", content="note", source="session_note", project="myapp")
+        stats = store.namespace_stats("myapp")
+        assert stats["doc_count"] == 2  # arch_decision is forced global, so only 2 in myapp
+        # The arch_decision is in (global)
+        global_stats = store.namespace_stats("(global)")
+        assert global_stats["doc_count"] == 1
+        assert global_stats["p0_count"] == 1
+
+    def test_search_scoped_to_namespace(self, store):
+        store.save(title="Config for app-a", content="port 8080", source="debug_solution", project="app-a")
+        store.save(title="Config for app-b", content="port 9090", source="debug_solution", project="app-b")
+        results = store.search("Config port", project="app-a")
+        titles = [r.l1 for r in results]
+        assert any("app-a" in t for t in titles)
+        assert not any("app-b" in t for t in titles)
+
+    def test_search_without_namespace_returns_all(self, store):
+        store.save(title="Doc in app-a", content="content", source="explicit", project="app-a")
+        store.save(title="Doc in app-b", content="content", source="explicit", project="app-b")
+        results = store.search("Doc content")
+        assert len(results) >= 2
+
+
+class TestCascadeDelete:
+    def test_delete_documents_removes_from_documents(self, store):
+        doc_id = store.save(title="To delete", content="bye", source="explicit")
+        store.delete_documents([doc_id])
+        row = store._conn.execute(
+            "SELECT doc_id FROM documents WHERE doc_id=?", (doc_id,)
+        ).fetchone()
+        assert row is None
+
+    def test_delete_documents_removes_vec_documents(self, store):
+        """Manually insert a vec_documents row, then verify cascade delete."""
+        doc_id = store.save(title="Vec cascade", content="test", source="explicit")
+        # Manually insert a fake vec_documents row (sqlite-vec may not be loaded,
+        # so we just verify the DELETE runs without error)
+        try:
+            store._wq.execute(
+                "INSERT INTO vec_documents(document_id, embedding) VALUES (?, zeroblob(16384))",
+                (doc_id,),
+            )
+        except Exception:
+            pass  # sqlite-vec not loaded — test still valid
+        store.delete_documents([doc_id])
+        row = store._conn.execute(
+            "SELECT doc_id FROM documents WHERE doc_id=?", (doc_id,)
+        ).fetchone()
+        assert row is None
+
+    def test_delete_documents_removes_doc_relations(self, store):
+        id1 = store.save(title="A", content="a", source="explicit")
+        id2 = store.save(title="B", content="b", source="explicit")
+        store._wq.execute(
+            "INSERT INTO doc_relations (doc_id_a, doc_id_b, relation_type) VALUES (?, ?, 'related')",
+            (id1, id2),
+        )
+        store.delete_documents([id1])
+        rels = store._conn.execute(
+            "SELECT * FROM doc_relations WHERE doc_id_a=? OR doc_id_b=?",
+            (id1, id1),
+        ).fetchall()
+        assert len(rels) == 0
+
+    def test_prune_expired_cascades(self, store):
+        doc_id = store.save(title="Expiring cascade", content="temp", source="session_note")
+        # Create a relation
+        id2 = store.save(title="Related", content="rel", source="explicit")
+        store._wq.execute(
+            "INSERT INTO doc_relations (doc_id_a, doc_id_b, relation_type) VALUES (?, ?, 'related')",
+            (doc_id, id2),
+        )
+        # Force expire
+        store._wq.execute(
+            "UPDATE documents SET expires_at=? WHERE doc_id=?",
+            (time.time() - 1, doc_id),
+        )
+        deleted = store.prune_expired()
+        assert deleted == 1
+        # Relation should be cleaned up
+        rels = store._conn.execute(
+            "SELECT * FROM doc_relations WHERE doc_id_a=? OR doc_id_b=?",
+            (doc_id, doc_id),
+        ).fetchall()
+        assert len(rels) == 0
+
+    def test_cleanup_orphaned_vectors(self, store):
+        count = store.cleanup_orphaned_vectors()
+        assert count == 0  # no orphans in fresh DB

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI entry point for agentmem.
+"""CLI entry point for am-memory.
 
 Usage:
   am init                                   # one-time setup (MCP + hooks + CLAUDE.md)
@@ -364,7 +364,7 @@ def main():
     status_p.add_argument("--detail", default="")
 
     # config
-    cfg_p = sub.add_parser("config", help="Get/set agentmem configuration")
+    cfg_p = sub.add_parser("config", help="Get/set am-memory configuration")
     cfg_p.add_argument("action", choices=["set", "get"])
     cfg_p.add_argument("--key", default=None, help="Config key (e.g. embedding_provider)")
     cfg_p.add_argument("--value", default=None, help="Config value")

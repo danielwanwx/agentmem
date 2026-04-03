@@ -1,5 +1,6 @@
-"""MemoryStore: main API surface for agentmem SDK."""
+"""MemoryStore: main API surface for am-memory SDK."""
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -12,6 +13,9 @@ from .search import search_documents
 from .state import StateManager
 from .session import SessionManager
 from .vector import embed_doc, vec_to_blob, upsert_vec
+from .write_queue import WriteQueue
+
+logger = logging.getLogger(__name__)
 
 # Source-aware TTL (days). Takes precedence over priority-based TTL.
 _SOURCE_TTL_DAYS: dict[str, int | None] = {
@@ -43,7 +47,7 @@ _SOURCE_PRIORITY: dict[str, str] = {
 }
 
 
-def _get_ttl_days(source: str, priority: str) -> "int | None":
+def _get_ttl_days(source: str, priority: str) -> int | None:
     """Return TTL in days. Source wins over priority; None = never expires."""
     if source in _SOURCE_TTL_DAYS:
         return _SOURCE_TTL_DAYS[source]
@@ -53,6 +57,65 @@ def _get_ttl_days(source: str, priority: str) -> "int | None":
 def _effective_priority(source: str, priority: str) -> str:
     """Return the priority used for search ranking. Source wins over caller-supplied priority."""
     return _SOURCE_PRIORITY.get(source, priority)
+
+
+def _normalize_fact(fact: str) -> str:
+    """Normalize a fact string for comparison."""
+    return fact.strip().lower()
+
+
+def _facts_similar(a: str, b: str) -> bool:
+    """Check if two facts are semantically similar using SequenceMatcher."""
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, _normalize_fact(a), _normalize_fact(b)).ratio() > 0.85
+
+
+def _key_facts_jaccard(new_facts: list[str], existing_facts: list[str]) -> float:
+    """Compute Jaccard overlap between two key_facts lists.
+
+    Uses fuzzy matching (>0.85 SequenceMatcher ratio) for fact comparison.
+    Returns 0.0-1.0. Returns 1.0 if both lists are empty.
+    """
+    if not new_facts and not existing_facts:
+        return 1.0
+    if not new_facts or not existing_facts:
+        return 0.0
+
+    new_normalized = [_normalize_fact(f) for f in new_facts]
+    existing_normalized = [_normalize_fact(f) for f in existing_facts]
+
+    # Count matches (fuzzy)
+    matched = 0
+    used = set()
+    for nf in new_normalized:
+        for j, ef in enumerate(existing_normalized):
+            if j not in used and _facts_similar(nf, ef):
+                matched += 1
+                used.add(j)
+                break
+
+    union_size = len(new_normalized) + len(existing_normalized) - matched
+    if union_size == 0:
+        return 1.0
+    return matched / union_size
+
+
+def _merge_facts_fuzzy(old_facts: list, new_facts: list) -> list:
+    """Merge two fact lists, deduplicating fuzzy-similar facts.
+
+    Keeps all unique facts from both lists. When a new fact is similar
+    to an existing one (>0.85 ratio), keeps the newer version.
+    """
+    merged = list(new_facts)  # new facts take priority
+    for old_f in old_facts:
+        is_dup = False
+        for new_f in merged:
+            if _facts_similar(str(old_f), str(new_f)):
+                is_dup = True
+                break
+        if not is_dup:
+            merged.append(old_f)
+    return merged
 
 
 def _merge_json_arrays(old_json: str, new_json: str) -> str:
@@ -72,9 +135,19 @@ def _merge_json_arrays(old_json: str, new_json: str) -> str:
 class MemoryStore:
     def __init__(self, db_path: str = None):
         self._db_path = db_path or str(DB_PATH)
-        self._conn = init_db(self._db_path)
-        self.state = StateManager(self._conn)
-        self.session = SessionManager(self._conn)
+        # Initialize schema via init_db (creates tables, runs migrations)
+        init_conn = init_db(self._db_path)
+        init_conn.close()  # Close the init connection
+
+        # WriteQueue owns the single write connection
+        self._wq = WriteQueue(self._db_path)
+        # Read connection for queries (separate from write conn, WAL allows concurrent reads)
+        self._conn = self._wq.read_conn()
+        # Lock for serializing reads on the shared read connection.
+        # SQLite connections are not thread-safe for concurrent cursor operations.
+        self._read_lock = threading.Lock()
+        self.state = StateManager(self._conn, self._wq, self._read_lock)
+        self.session = SessionManager(self._conn, self._wq, self._read_lock)
         self._pruned_this_session = False
 
     def _track_session_doc(self, doc_id: int) -> None:
@@ -86,39 +159,67 @@ class MemoryStore:
                 existing_docs.append(doc_id)
                 self.state.set(f"session_docs:{current_sid}", existing_docs)
 
-    def _find_duplicate(self, title: str, source: str, project: str = None) -> "int | None":
+    def _find_duplicate(self, title: str, source: str, new_key_facts: list[str],
+                        project: str = None,
+                        conn: sqlite3.Connection = None) -> int | None:
         """Check if a document with similar title and same source exists.
-        Uses FTS5 MATCH on title. Returns doc_id if duplicate found, else None.
-        Scoped to same project (or both global).
+
+        Two-stage detection:
+        1. FTS5 MATCH on title for candidate retrieval (fast)
+        2. key_facts Jaccard overlap >= 0.5 for precision check
+
+        Returns doc_id if duplicate confirmed, else None.
         """
+        c = conn or self._conn
         if not title or len(title) < 3:
             return None
         try:
             if project:
-                rows = self._conn.execute(
-                    """SELECT d.doc_id, d.title, d.source, fts.rank
+                rows = c.execute(
+                    """SELECT d.doc_id, d.title, d.source, d.key_facts, fts.rank
                        FROM documents_fts fts
                        JOIN documents d ON d.doc_id = fts.rowid
                        WHERE documents_fts MATCH ?
                          AND d.source = ?
                          AND (d.project = ? OR d.project IS NULL)
                        ORDER BY fts.rank
-                       LIMIT 1""",
+                       LIMIT 3""",
                     (title, source, project),
                 ).fetchall()
             else:
-                rows = self._conn.execute(
-                    """SELECT d.doc_id, d.title, d.source, fts.rank
+                rows = c.execute(
+                    """SELECT d.doc_id, d.title, d.source, d.key_facts, fts.rank
                        FROM documents_fts fts
                        JOIN documents d ON d.doc_id = fts.rowid
                        WHERE documents_fts MATCH ?
                          AND d.source = ?
                        ORDER BY fts.rank
-                       LIMIT 1""",
+                       LIMIT 3""",
                     (title, source),
                 ).fetchall()
-            if rows and rows[0]["rank"] > -5.0:
-                return rows[0]["doc_id"]
+            if not rows:
+                return None
+            # Stage 1: BM25 rank threshold
+            candidates = [r for r in rows if r["rank"] > -5.0]
+            if not candidates:
+                return None
+            # Stage 2: key_facts Jaccard overlap for precision
+            best = candidates[0]
+            existing_facts = json.loads(best["key_facts"] or "[]")
+            overlap = _key_facts_jaccard(new_key_facts, existing_facts)
+
+            # High overlap (>= 0.3): confirmed duplicate with fact similarity
+            # Both empty facts: fall back to title match only
+            # Any shared facts at all with good BM25: likely same topic
+            if overlap >= 0.3:
+                logger.info("Dedup: '%s' matches doc %d (Jaccard=%.2f)",
+                            title[:40], best["doc_id"], overlap)
+                return best["doc_id"]
+            # Both have no facts — title match alone is sufficient
+            if not new_key_facts and not existing_facts:
+                return best["doc_id"]
+            # One or both have facts but low overlap — not a duplicate
+            return None
         except Exception:
             pass
         return None
@@ -132,10 +233,13 @@ class MemoryStore:
         raw_content: str = None,
         file_path: str = None,
         project: str = None,
+        force_new: bool = False,
     ) -> int:
         """Extract fields from content and persist to documents table.
         When file_path is provided, upserts by file_path (prevents duplicate docs
-        for the same file across multiple edits). Returns doc_id.
+        for the same file across multiple edits).
+        When force_new=True, always creates a new document (skip dedup).
+        Returns doc_id.
         """
         fields = extract_fields(content, title_hint=title)
         actual_title = title or fields.get("title", "Untitled")
@@ -147,20 +251,33 @@ class MemoryStore:
         # architectural_decision is always global (project=NULL)
         effective_project = None if source == "architectural_decision" else project
 
-        # Dedup: check for existing doc with same title + source + project
+        # Dedup: check for existing doc with same title + source + project + key_facts overlap
         # file_path upsert takes precedence (skip dedup if file_path provided)
-        if not file_path:
-            dup_id = self._find_duplicate(actual_title, source, effective_project)
-            if dup_id is not None:
-                existing = self._conn.execute(
-                    "SELECT key_facts, decisions, code_sigs, metrics FROM documents WHERE doc_id=?",
-                    (dup_id,),
-                ).fetchone()
-                merged_kf = _merge_json_arrays(existing["key_facts"], json.dumps(fields["key_facts"]))
+        # force_new bypasses dedup entirely
+        # All reads from self._conn are protected by _read_lock for thread safety.
+        dup_id = None
+        existing = None
+        if not file_path and not force_new:
+            with self._read_lock:
+                dup_id = self._find_duplicate(
+                    actual_title, source, fields.get("key_facts", []), effective_project
+                )
+                if dup_id is not None:
+                    existing = self._conn.execute(
+                        "SELECT key_facts, decisions, code_sigs, metrics FROM documents WHERE doc_id=?",
+                        (dup_id,),
+                    ).fetchone()
+            if dup_id is not None and existing:
+                # Fuzzy merge for key_facts (dedup near-identical facts)
+                old_kf = json.loads(existing["key_facts"] or "[]")
+                merged_kf = json.dumps(_merge_facts_fuzzy(old_kf, fields["key_facts"]))
+                # Exact dedup for decisions, code_sigs, metrics
                 merged_dec = _merge_json_arrays(existing["decisions"], json.dumps(fields["decisions"]))
                 merged_cs = _merge_json_arrays(existing["code_sigs"], json.dumps(fields["code_sigs"]))
                 merged_met = _merge_json_arrays(existing["metrics"], json.dumps(fields["metrics"]))
-                self._conn.execute(
+                logger.info("Merged doc '%s' into doc_id=%d, %d facts",
+                            actual_title[:40], dup_id, len(json.loads(merged_kf)))
+                self._wq.execute(
                     """UPDATE documents SET title=?, summary=?, key_facts=?, decisions=?,
                        code_sigs=?, metrics=?, raw_content=?, priority=?, source=?,
                        generator='rule', expires_at=?, project=?
@@ -180,18 +297,18 @@ class MemoryStore:
                         dup_id,
                     ),
                 )
-                self._conn.commit()
                 self._embed_async(dup_id, actual_title, fields, raw_content or content)
                 self._track_session_doc(dup_id)
                 return dup_id
 
         if file_path:
             # Upsert: update existing doc for this file_path, or insert new
-            existing = self._conn.execute(
-                "SELECT doc_id FROM documents WHERE file_path=?", (file_path,)
-            ).fetchone()
+            with self._read_lock:
+                existing = self._conn.execute(
+                    "SELECT doc_id FROM documents WHERE file_path=?", (file_path,)
+                ).fetchone()
             if existing:
-                self._conn.execute(
+                self._wq.execute(
                     """UPDATE documents SET title=?, summary=?, key_facts=?, decisions=?,
                        code_sigs=?, metrics=?, raw_content=?, priority=?, source=?,
                        generator='rule', expires_at=?, project=?
@@ -211,12 +328,11 @@ class MemoryStore:
                         file_path,
                     ),
                 )
-                self._conn.commit()
                 self._embed_async(existing["doc_id"], actual_title, fields, raw_content or content)
                 self._track_session_doc(existing["doc_id"])
                 return existing["doc_id"]
 
-        cur = self._conn.execute(
+        doc_id = self._wq.execute(
             """INSERT INTO documents
                (title, summary, key_facts, decisions, code_sigs, metrics,
                 raw_content, priority, source, generator, file_path, expires_at, project)
@@ -236,8 +352,6 @@ class MemoryStore:
                 effective_project,
             ),
         )
-        self._conn.commit()
-        doc_id = cur.lastrowid
         self._embed_async(doc_id, actual_title, fields, raw_content or content)
         self._track_session_doc(doc_id)
         return doc_id
@@ -245,23 +359,14 @@ class MemoryStore:
     def _embed_async(self, doc_id: int, title: str, rule_fields: dict, content: str = "") -> None:
         """Background thread: LLM extraction → UPDATE fields → embedding → UPDATE embedding.
 
-        Flow:
-          1. Try LLM extraction from raw content (better quality than rules)
-          2. If LLM succeeds: UPDATE summary/key_facts/decisions/generator in DB
-          3. Compute embedding from best available fields
-          4. UPDATE embedding
-
-        daemon=False so the thread completes even if the main process exits
-        (important for scripts like kb_import.py that exit after save()).
-        Opens its own DB connection to avoid racing the caller's connection.
+        Uses WriteQueue for all DB writes (thread-safe).
+        daemon=False so the thread completes even if the main process exits.
         """
-        db_path = self._db_path
+        wq = self._wq
 
         def _run():
             use_fields = rule_fields
             try:
-                conn = sqlite3.connect(db_path, check_same_thread=False)
-
                 # Step 1: LLM extraction (if content provided)
                 if content:
                     llm_fields = llm_extract(content, title_hint=title)
@@ -269,8 +374,8 @@ class MemoryStore:
                         # Preserve rule-extracted code_sigs/metrics
                         llm_fields["code_sigs"] = rule_fields.get("code_sigs", [])
                         llm_fields["metrics"]   = rule_fields.get("metrics", [])
-                        # Update DB with LLM-quality fields
-                        conn.execute(
+                        # Update DB with LLM-quality fields via WriteQueue
+                        wq.execute(
                             """UPDATE documents
                                SET title=?, summary=?, key_facts=?, decisions=?,
                                    generator='llm'
@@ -283,7 +388,6 @@ class MemoryStore:
                                 doc_id,
                             ),
                         )
-                        conn.commit()
                         use_fields = llm_fields
 
                 # Step 2: Compute embedding from best available fields
@@ -293,17 +397,16 @@ class MemoryStore:
                     use_fields.get("key_facts") or [],
                 )
                 if vec is not None:
-                    conn.execute(
+                    wq.execute(
                         "UPDATE documents SET embedding=? WHERE doc_id=?",
                         (vec_to_blob(vec), doc_id),
                     )
-                    conn.commit()
-                    upsert_vec(conn, doc_id, vec)
-                    conn.commit()
+                    # upsert_vec needs a connection — use a transaction for atomicity
+                    with wq.transaction() as conn:
+                        upsert_vec(conn, doc_id, vec)
 
-                conn.close()
             except Exception:
-                pass
+                logger.debug("_embed_async failed for doc_id=%d", doc_id, exc_info=True)
 
         threading.Thread(target=_run, daemon=False).start()
 
@@ -314,85 +417,149 @@ class MemoryStore:
         if not self._pruned_this_session:
             self._pruned_this_session = True
             self._prune_expired_async()
-        results = search_documents(self._conn, query, max_results=max_results, project=project)
+        with self._read_lock:
+            results = search_documents(self._conn, query, max_results=max_results, project=project)
         if results:
             self._touch_accessed_async([r.id for r in results])
         return results
+
+    def delete_documents(self, doc_ids: list[int]) -> int:
+        """Delete documents and cascade to vec_documents + doc_relations.
+
+        Central delete method — all document deletion should go through here
+        to ensure vec_documents and doc_relations are cleaned up.
+        Returns count deleted.
+        """
+        if not doc_ids:
+            return 0
+        placeholders = ",".join("?" * len(doc_ids))
+        with self._wq.transaction() as conn:
+            conn.execute(
+                f"DELETE FROM documents WHERE doc_id IN ({placeholders})", doc_ids
+            )
+            try:
+                conn.execute(
+                    f"DELETE FROM vec_documents WHERE document_id IN ({placeholders})",
+                    doc_ids,
+                )
+            except Exception:
+                pass  # vec_documents may not exist (sqlite-vec not loaded)
+            try:
+                conn.execute(
+                    f"DELETE FROM doc_relations WHERE doc_id_a IN ({placeholders}) OR doc_id_b IN ({placeholders})",
+                    doc_ids + doc_ids,
+                )
+            except Exception:
+                pass  # doc_relations may not exist
+        return len(doc_ids)
+
+    def cleanup_orphaned_vectors(self) -> int:
+        """Remove vec_documents rows that have no matching documents row.
+
+        One-time migration cleanup for historical orphans.
+        Returns count of orphans removed.
+        """
+        try:
+            with self._read_lock:
+                orphan_ids = [
+                    row[0] for row in self._conn.execute(
+                        """SELECT v.document_id FROM vec_documents v
+                           LEFT JOIN documents d ON d.doc_id = v.document_id
+                           WHERE d.doc_id IS NULL"""
+                    ).fetchall()
+                ]
+            if not orphan_ids:
+                return 0
+            placeholders = ",".join("?" * len(orphan_ids))
+            self._wq.execute(
+                f"DELETE FROM vec_documents WHERE document_id IN ({placeholders})",
+                orphan_ids,
+            )
+            return len(orphan_ids)
+        except Exception:
+            return 0  # vec_documents may not exist
 
     def prune_expired(self) -> int:
         """Delete documents whose expires_at has passed. Returns count deleted.
 
         P0 documents (expires_at IS NULL) are never deleted.
-        Also removes orphaned rows from vec_documents (no FK cascade in SQLite).
+        Cascades to vec_documents and doc_relations via delete_documents().
         Called automatically on each search() call via _prune_expired_async().
         Can also be called manually: am doc prune.
         """
-        expired_ids = [
-            row[0] for row in self._conn.execute(
-                "SELECT doc_id FROM documents WHERE expires_at IS NOT NULL AND expires_at < ?",
-                (time.time(),),
-            ).fetchall()
-        ]
-        if not expired_ids:
-            return 0
-        placeholders = ",".join("?" * len(expired_ids))
-        self._conn.execute(
-            f"DELETE FROM documents WHERE doc_id IN ({placeholders})", expired_ids
-        )
-        try:
-            self._conn.execute(
-                f"DELETE FROM vec_documents WHERE document_id IN ({placeholders})",
-                expired_ids,
-            )
-        except Exception:
-            pass  # vec_documents may not exist (sqlite-vec not loaded)
-        self._conn.commit()
-        return len(expired_ids)
+        with self._read_lock:
+            expired_ids = [
+                row[0] for row in self._conn.execute(
+                    "SELECT doc_id FROM documents WHERE expires_at IS NOT NULL AND expires_at < ?",
+                    (time.time(),),
+                ).fetchall()
+            ]
+        return self.delete_documents(expired_ids)
 
     def _prune_expired_async(self) -> None:
-        """Fire-and-forget background prune. Called from search() once per session."""
+        """Fire-and-forget background prune. Called from search() once per session.
+
+        Uses WriteQueue for thread-safe writes.
+        """
+        wq = self._wq
         db_path = self._db_path
 
         def _run():
             try:
-                conn = sqlite3.connect(db_path, check_same_thread=False)
+                # Use a separate read connection for the SELECT
+                read_conn = sqlite3.connect(db_path, check_same_thread=False)
+                read_conn.row_factory = sqlite3.Row
                 expired_ids = [
-                    row[0] for row in conn.execute(
+                    row[0] for row in read_conn.execute(
                         "SELECT doc_id FROM documents "
                         "WHERE expires_at IS NOT NULL AND expires_at < ?",
                         (time.time(),),
                     ).fetchall()
                 ]
+                read_conn.close()
                 if expired_ids:
                     placeholders = ",".join("?" * len(expired_ids))
-                    conn.execute(
-                        f"DELETE FROM documents WHERE doc_id IN ({placeholders})",
-                        expired_ids,
-                    )
-                    try:
+                    with wq.transaction() as conn:
                         conn.execute(
-                            f"DELETE FROM vec_documents WHERE document_id IN ({placeholders})",
+                            f"DELETE FROM documents WHERE doc_id IN ({placeholders})",
                             expired_ids,
                         )
-                    except Exception:
-                        pass  # vec_documents may not exist
-                    conn.commit()
-                conn.close()
+                        try:
+                            conn.execute(
+                                f"DELETE FROM vec_documents WHERE document_id IN ({placeholders})",
+                                expired_ids,
+                            )
+                        except Exception:
+                            pass  # vec_documents may not exist
+                        try:
+                            conn.execute(
+                                f"DELETE FROM doc_relations WHERE doc_id_a IN ({placeholders}) OR doc_id_b IN ({placeholders})",
+                                expired_ids + expired_ids,
+                            )
+                        except Exception:
+                            pass
             except Exception:
-                pass
+                logger.debug("_prune_expired_async failed", exc_info=True)
 
         threading.Thread(target=_run, daemon=True).start()
 
     def _touch_accessed_async(self, doc_ids: list[int]) -> None:
-        """Background: reset expires_at from now for each accessed doc (LRU TTL extension)."""
+        """Background: reset expires_at from now for each accessed doc (LRU TTL extension).
+
+        Uses WriteQueue for thread-safe writes.
+        """
+        wq = self._wq
         db_path = self._db_path
 
         def _run():
             try:
-                conn = sqlite3.connect(db_path, check_same_thread=False)
+                # Read source/priority from a separate read connection
+                read_conn = sqlite3.connect(db_path, check_same_thread=False)
+                read_conn.row_factory = sqlite3.Row
                 now = time.time()
+                updates = []
                 for doc_id in doc_ids:
-                    row = conn.execute(
+                    row = read_conn.execute(
                         "SELECT source, priority FROM documents WHERE doc_id=?",
                         (doc_id,),
                     ).fetchone()
@@ -400,34 +567,34 @@ class MemoryStore:
                         continue
                     ttl = _get_ttl_days(row[0], row[1])
                     if ttl:
-                        conn.execute(
-                            """UPDATE documents
-                               SET last_accessed_at=?, expires_at=?
-                               WHERE doc_id=?""",
-                            (now, now + ttl * 86400, doc_id),
-                        )
-                conn.commit()
-                conn.close()
+                        updates.append((now, now + ttl * 86400, doc_id))
+                read_conn.close()
+                if updates:
+                    wq.executemany(
+                        "UPDATE documents SET last_accessed_at=?, expires_at=? WHERE doc_id=?",
+                        updates,
+                    )
             except Exception:
-                pass
+                logger.debug("_touch_accessed_async failed", exc_info=True)
 
         threading.Thread(target=_run, daemon=True).start()
 
     def _get_related_docs(self, doc_id: int, exclude_ids: set) -> list[dict]:
         """Fetch related documents for inject expansion."""
         try:
-            rows = self._conn.execute(
-                """SELECT d.doc_id, d.title, d.summary, d.key_facts, r.relation_type
-                   FROM doc_relations r
-                   JOIN documents d ON d.doc_id = CASE
-                       WHEN r.doc_id_a = ? THEN r.doc_id_b
-                       ELSE r.doc_id_a END
-                   WHERE (r.doc_id_a = ? OR r.doc_id_b = ?)
-                     AND (d.expires_at IS NULL OR d.expires_at > strftime('%s','now'))
-                   ORDER BY d.priority, d.created_at DESC
-                   LIMIT 3""",
-                (doc_id, doc_id, doc_id),
-            ).fetchall()
+            with self._read_lock:
+                rows = self._conn.execute(
+                    """SELECT d.doc_id, d.title, d.summary, d.key_facts, r.relation_type
+                       FROM doc_relations r
+                       JOIN documents d ON d.doc_id = CASE
+                           WHEN r.doc_id_a = ? THEN r.doc_id_b
+                           ELSE r.doc_id_a END
+                       WHERE (r.doc_id_a = ? OR r.doc_id_b = ?)
+                         AND (d.expires_at IS NULL OR d.expires_at > strftime('%s','now'))
+                       ORDER BY d.priority, d.created_at DESC
+                       LIMIT 3""",
+                    (doc_id, doc_id, doc_id),
+                ).fetchall()
         except Exception:
             return []
         results = []
@@ -500,7 +667,51 @@ class MemoryStore:
         if not blocks:
             return ""
 
-        return "# [agentmem] Relevant context\n" + "\n\n---\n".join(blocks)
+        return "# [am-memory] Relevant context\n" + "\n\n---\n".join(blocks)
+
+    def namespace_list(self) -> list[dict]:
+        """Return all known namespaces (projects) with document counts and last updated.
+
+        Returns list of dicts: [{project, doc_count, last_updated}].
+        project=None is returned as '(global)'.
+        """
+        with self._read_lock:
+            rows = self._conn.execute(
+                """SELECT
+                       COALESCE(project, '(global)') as project,
+                       COUNT(*) as doc_count,
+                       MAX(created_at) as last_updated
+                   FROM documents
+                   GROUP BY project
+                   ORDER BY doc_count DESC"""
+            ).fetchall()
+        return [{"project": r["project"], "doc_count": r["doc_count"],
+                 "last_updated": r["last_updated"]} for r in rows]
+
+    def namespace_stats(self, project: str) -> dict:
+        """Return detailed stats for a specific namespace/project."""
+        is_global = project in ("(global)", "global", "")
+        where = "project IS NULL" if is_global else "project = ?"
+        params = () if is_global else (project,)
+        with self._read_lock:
+            row = self._conn.execute(
+                f"""SELECT COUNT(*) as doc_count,
+                           SUM(CASE WHEN priority='P0' THEN 1 ELSE 0 END) as p0_count,
+                           SUM(CASE WHEN priority='P1' THEN 1 ELSE 0 END) as p1_count,
+                           SUM(CASE WHEN priority='P2' THEN 1 ELSE 0 END) as p2_count,
+                           MAX(created_at) as last_updated
+                    FROM documents WHERE {where}""",
+                params,
+            ).fetchone()
+        return {
+            "project": project,
+            "doc_count": row["doc_count"],
+            "p0_count": row["p0_count"] or 0,
+            "p1_count": row["p1_count"] or 0,
+            "p2_count": row["p2_count"] or 0,
+            "last_updated": row["last_updated"],
+        }
 
     def close(self):
         self._conn.close()
+        self._wq.close()
